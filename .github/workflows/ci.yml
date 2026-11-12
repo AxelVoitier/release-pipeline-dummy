@@ -13,8 +13,12 @@ permissions: {}
 jobs:
   build:
     uses: ./.github/workflows/build.yml
+    # GitHub validates permission requests even for skipped attestation jobs.
+    # Each called job narrows these grants; attest: false skips the signing jobs.
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     with:
       attest: false
 
