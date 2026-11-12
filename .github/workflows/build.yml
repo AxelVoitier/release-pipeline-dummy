@@ -73,7 +73,7 @@ jobs:
           fetch-depth: 0 # VCS versioning needs tags + history in CI and release alike
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -312,7 +312,7 @@ jobs:
           gh attestation verify "dist/$SDIST" --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build.yml" \
             --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
-      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -395,7 +395,7 @@ jobs:
       # Proves: the sdist and wheel are the ones the build jobs digested.
       - name: Check digests
         run: printf '%s  dist/%s\n' "$SDIST_SHA256" "$SDIST" "$WHEEL_SHA256" "$WHEEL" | sha256sum -c -
-      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false

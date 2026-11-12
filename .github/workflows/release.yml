@@ -367,8 +367,7 @@ jobs:
       - &publish
         name: Publish (trusted publishing, PEP 740 attestations on)
         if: steps.rule.outputs.upload == 'true'
-        # TODO-PIN: pin the latest release by full SHA before the first real run; must be >= v1.11.0 (PEP 740 attestations on by default).
-        uses: pypa/gh-action-pypi-publish@0000000000000000000000000000000000000000 # vX.Y.Z TODO-PIN
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           repository-url: ${{ env.UPLOAD_URL }}
           packages-dir: upload/
@@ -395,7 +394,7 @@ jobs:
     # pypi-attestations call on, third-party code runs (a runner has passwordless sudo), so nothing after it is trusted
     # to produce evidence: digests that leave this job are computed before it.
     steps: &verify-steps
-      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
