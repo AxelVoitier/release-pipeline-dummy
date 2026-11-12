@@ -1,0 +1,54 @@
+# Project CI (ADAPT): builds through build.yml (never attests) and tests that exact wheel.
+# Must also run on v* tag pushes: release.yml's origin-check waits for this run on the tagged SHA.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+    with:
+      attest: false
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {}
+    strategy:
+      matrix:
+        python: ["3.10", "3.14"]
+    env:
+      WHEEL: ${{ needs.build.outputs.wheel-name }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
+      PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel
+          path: wheelhouse
+      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+        with:
+          version: "0.11.32" # keep in sync with UV_VERSION in build.yml / release.yml
+          enable-cache: false
+      # Proves: the wheel build.yml produced (checked by digest) passes the test suite once installed.
+      - name: Test the built wheel
+        run: |
+          echo "$WHEEL_SHA256  wheelhouse/$WHEEL" | sha256sum -c -
+
+          uv venv --python "$PYTHON" .venv
+          uv pip install --python .venv "wheelhouse/$WHEEL" pytest
+
+          # Test the installed wheel, not the checkout.
+          rm -rf src
+          .venv/bin/python -m pytest -q tests

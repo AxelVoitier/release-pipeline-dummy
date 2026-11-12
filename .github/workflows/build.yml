@@ -1,0 +1,494 @@
+# Reusable build: sdist -> wheel (from the sdist) -> SBOM, with optional attestation.
+# Spec: .scratch/secure-pypi-publish/spec.md ("build.yml"). Every step is INV unless marked.
+# Called by release.yml (attest: true) and by the project's CI (attest: false).
+# Do not add scripts read from the checkout: all logic stays inline (Build pinning policy).
+#
+# Reading guide: as in release.yml ("# Proves:" lines, "# ---- <claim> ----" divisions, `fail` for every check).
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      attest:
+        description: Attest sdist, wheel and SBOM (release only; the caller must grant id-token + attestations write)
+        type: boolean
+        default: false
+      expected-version:
+        description: If set, the built version must equal it (release passes the tag version)
+        type: string
+        default: ""
+    outputs:
+      sdist-name:
+        value: ${{ jobs.build-sdist.outputs.sdist-name }}
+      sdist-sha256:
+        value: ${{ jobs.build-sdist.outputs.sdist-sha256 }}
+      wheel-name:
+        value: ${{ jobs.build-wheel.outputs.wheel-name }}
+      wheel-sha256:
+        value: ${{ jobs.build-wheel.outputs.wheel-sha256 }}
+      sbom-sha256:
+        value: ${{ jobs.sbom.outputs.sbom-sha256 }}
+      bundle-sdist-sha256:
+        value: ${{ jobs.attest-sdist.outputs.bundle-sha256 }}
+      bundle-wheel-sha256:
+        value: ${{ jobs.attest-wheel.outputs.bundle-sha256 }}
+      bundle-sbom-sha256:
+        value: ${{ jobs.attest-sbom.outputs.bundle-sha256 }}
+      source-date-epoch:
+        value: ${{ jobs.build-sdist.outputs.source-date-epoch }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash # bash -eo pipefail
+
+env:
+  # Hand-bumped pins (Dependabot does not see these). Keep release.yml's copies in sync.
+  PYTHON_VERSION: "3.14.6"
+  UV_VERSION: "0.11.32"
+  DEFAULT_BUILD_COOLDOWN_DAYS: "7"
+  # Tool pins: exact version + resolution frozen at TOOLS_EXCLUDE_NEWER (spec amendment A2).
+  TOOLS_EXCLUDE_NEWER: "2026-11-01T00:00:00Z"
+  CYCLONEDX_BOM: "cyclonedx-bom==7.6.0"
+  UV_NO_CONFIG: "1" # never read uv.toml / [tool.uv] from the project checkout
+
+jobs:
+  # Proves: the sdist was built from this commit in a hash-locked build environment the pipeline generated itself,
+  # and carries that lock. Runs third-party code (the build backend), so it holds no credential; the lock digest is
+  # recorded before any build dependency runs.
+  build-sdist:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sdist-name: ${{ steps.check.outputs.sdist-name }}
+      sdist-sha256: ${{ steps.check.outputs.sdist-sha256 }}
+      source-date-epoch: ${{ steps.lock.outputs.source-date-epoch }}
+      lock-sha256: ${{ steps.lock.outputs.lock-sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0 # VCS versioning needs tags + history in CI and release alike
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+
+      # Proves: [build-system] is complete; the lock resolves from wheels only, under the cooldown; records its digest.
+      - name: Check [build-system], generate the build lock
+        id: lock
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # ---- No lock committed in the repo ----
+
+          # The pipeline generates it; a committed one would be overwritten and dirty VCS versions.
+          if [ -e build-constraints.txt ]; then
+            fail "build-constraints.txt exists in the checkout; the pipeline generates it, remove it from the repo"
+          fi
+
+          # ---- SOURCE_DATE_EPOCH = commit time, not in the future ----
+
+          # Same inputs, same bytes. The commit time also anchors the cooldown: a future-dated commit would switch it off.
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          latest_allowed=$(( $(date +%s) + 300 ))
+          [ "$SOURCE_DATE_EPOCH" -le "$latest_allowed" ] \
+            || fail "the commit is dated in the future ($(date -ud "@$SOURCE_DATE_EPOCH")); the build cooldown is anchored on it"
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
+          echo "source-date-epoch=$SOURCE_DATE_EPOCH" >> "$GITHUB_OUTPUT"
+          export SOURCE_DATE_EPOCH
+
+          # ---- [build-system] is complete; cooldown and == pin exemptions become uv arguments ----
+
+          # Writes $RUNNER_TEMP/build-requires.in (build-system.requires) and $RUNNER_TEMP/compile-args.
+          uv run --no-project --python "$PYTHON_VERSION" python -I - <<'PY'
+          import json, os, re, sys, tomllib, urllib.request
+          from datetime import datetime, timezone
+
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+
+          def iso(timestamp):
+              return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+          with open("pyproject.toml", "rb") as f:
+              pyproject = tomllib.load(f)
+
+          # Without [build-system], uv silently falls back to legacy setuptools; in-tree backends are not supported.
+          build_system = pyproject.get("build-system")
+          if not build_system or "requires" not in build_system or "build-backend" not in build_system:
+              fail("pyproject.toml needs a [build-system] table with requires and build-backend")
+          if "backend-path" in build_system:
+              fail("[build-system] backend-path (in-tree backend) is not supported")
+
+          # The one knob: [tool.release-pipeline] build-cooldown-days, default from this workflow's env.
+          days = pyproject.get("tool", {}).get("release-pipeline", {}).get(
+              "build-cooldown-days", int(os.environ["DEFAULT_BUILD_COOLDOWN_DAYS"]))
+          if type(days) is not int or days < 0:
+              fail("[tool.release-pipeline] build-cooldown-days must be an integer >= 0")
+          if days == 0:
+              print("::warning::build-cooldown-days = 0: build dependencies are not cooled down")
+
+          # Cooldown: only files uploaded at least `days` before the commit.
+          anchor = int(os.environ["SOURCE_DATE_EPOCH"])
+          cutoff = anchor - days * 86400
+          args = ["--exclude-newer", iso(cutoff)]
+
+          # A requirement pinned with == (or ===) inside the cooldown is exempted, for that package only, with a warning.
+          PINNED = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*===?\s*([A-Za-z0-9.!+_-]+)\s*(;.*)?")
+          for requirement in build_system["requires"]:
+              pin = PINNED.fullmatch(requirement)
+              if not pin:
+                  continue
+              name, version = pin.group(1), pin.group(3)
+              with urllib.request.urlopen(f"https://pypi.org/pypi/{name}/{version}/json") as f:
+                  release = json.load(f)
+              uploaded = max(
+                  datetime.fromisoformat(u["upload_time_iso_8601"].replace("Z", "+00:00")).timestamp()
+                  for u in release["urls"])
+              if uploaded > cutoff:
+                  print(f"::warning::{name}=={version} is inside the {days}-day cooldown (uploaded "
+                        f"{(anchor - uploaded) / 86400:.1f} days before the commit); exempted because it is pinned with ==")
+                  args += ["--exclude-newer-package", f"{name}={iso(int(uploaded) + 1)}"]
+
+          tmp = os.environ["RUNNER_TEMP"]
+          with open(f"{tmp}/build-requires.in", "w") as f:
+              f.write("\n".join(build_system["requires"]) + "\n")
+          with open(f"{tmp}/compile-args", "w") as f:
+              f.write("\n".join(args) + "\n")
+          PY
+
+          # ---- The lock resolves from wheels only, under the cooldown, with hashes ----
+
+          # --no-build: resolution never builds an sdist, so no third-party code runs before lock-sha256 is recorded.
+          # A build dependency without a wheel fails here (documented reversal: drop --no-build; the lock digest then
+          # no longer covers that dependency).
+          mapfile -t COMPILE_ARGS < "$RUNNER_TEMP/compile-args"
+          uv pip compile "$RUNNER_TEMP/build-requires.in" --generate-hashes --no-header --no-annotate --no-build \
+            --python-version "$PYTHON_VERSION" "${COMPILE_ARGS[@]}" -o build-constraints.txt \
+            || fail "Cannot resolve build-system.requires from wheels under the cooldown. A build dependency without a wheel is not supported (see the error above). A lower bound that only a version inside the cooldown satisfies must be pinned with == to override it."
+          cat build-constraints.txt
+
+          # ---- Record the lock digest ----
+
+          # Recorded before any build dependency runs: later steps of this job are not trusted to report on the lock.
+          lock_sha256=$(sha256sum build-constraints.txt | cut -d' ' -f1)
+          echo "lock-sha256=$lock_sha256" >> "$GITHUB_OUTPUT"
+
+      # First third-party code in this job: the build backend and its dependencies, every one hash-checked.
+      - name: Build the sdist with the hash-locked build environment
+        run: uv build --sdist --out-dir dist --python "$PYTHON_VERSION" --build-constraints build-constraints.txt --require-hashes
+
+      # Mistake checks: the backend already ran in this job, so they can't stop a malicious one (backstops: the lock
+      # check in build-wheel, verify-testpypi, the attestations).
+      # Proves: one sdist, carrying the lock that was used, with the expected version.
+      - name: Check the lock is in the sdist, and the version
+        id: check
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected-version }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # ---- Exactly one sdist ----
+
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          [ "${#sdists[@]}" -eq 1 ] || fail "expected exactly one sdist in dist/"
+          SDIST=${sdists[0]##*/}
+          TOP=${SDIST%.tar.gz}
+
+          # ---- The lock is at the sdist root, identical to the one used ----
+
+          tar -xzOf "dist/$SDIST" "$TOP/build-constraints.txt" > "$RUNNER_TEMP/lock-in-sdist" \
+            || fail "build-constraints.txt is missing from the sdist root: add the backend's sdist include line"
+          cmp -s build-constraints.txt "$RUNNER_TEMP/lock-in-sdist" || fail "the lock in the sdist differs from the one used"
+
+          # ---- Built version = tag version (release only; tags are canonical, so a string compare) ----
+
+          VERSION=$(tar -xzOf "dist/$SDIST" "$TOP/PKG-INFO" | sed -n 's/^Version: //p' | head -n1)
+          if [ -n "$EXPECTED_VERSION" ] && [ "$VERSION" != "$EXPECTED_VERSION" ]; then
+            fail "built version '$VERSION' != tag version '$EXPECTED_VERSION'"
+          fi
+
+          # ---- Outputs ----
+
+          sdist_sha256=$(sha256sum "dist/$SDIST" | cut -d' ' -f1)
+          echo "sdist-name=$SDIST" >> "$GITHUB_OUTPUT"
+          echo "sdist-sha256=$sdist_sha256" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sdist
+          path: dist/${{ steps.check.outputs.sdist-name }}
+          if-no-files-found: error
+
+  # Signs "built from this commit by build.yml" (GitHub attestation) for exactly the digested file. Holds the OIDC
+  # token and attestations: write, so it runs no package code. Shared with attest-wheel and attest-sbom (YAML anchor).
+  attest-sdist:
+    needs: build-sdist
+    if: inputs.attest
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+    outputs:
+      bundle-sha256: ${{ steps.bundle.outputs.bundle-sha256 }}
+    env:
+      ARTIFACT: sdist
+      FILE: ${{ needs.build-sdist.outputs.sdist-name }}
+      SHA256: ${{ needs.build-sdist.outputs.sdist-sha256 }}
+    steps: &attest-steps
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: subject
+      # Proves: the file to sign is the one the producing job digested.
+      - name: Check the digest from the producing job's outputs
+        run: echo "$SHA256  subject/$FILE" | sha256sum -c -
+      - id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: subject/${{ env.FILE }}
+          create-storage-record: false # would need artifact-metadata: write; not used (spec amendment A3)
+      - name: Name the bundle, record its digest
+        id: bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          # <file>.sigstore.json, kept out of dist/; github-release checks the artifact against this digest.
+          mkdir bundle
+          cp "$BUNDLE" "bundle/$FILE.sigstore.json"
+          bundle_sha256=$(sha256sum "bundle/$FILE.sigstore.json" | cut -d' ' -f1)
+          echo "bundle-sha256=$bundle_sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-${{ env.ARTIFACT }}
+          path: bundle/
+          if-no-files-found: error
+
+  # Proves: the wheel was built from the (attested) sdist alone, with the lock build-sdist generated.
+  # Runs third-party code (the build backend), so it holds no credential.
+  build-wheel:
+    needs: [build-sdist, attest-sdist]
+    # Runs after attest-sdist when attesting, right after build-sdist otherwise.
+    if: ${{ !cancelled() && needs.build-sdist.result == 'success' && (needs.attest-sdist.result == 'success' || (needs.attest-sdist.result == 'skipped' && !inputs.attest)) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      wheel-name: ${{ steps.out.outputs.wheel-name }}
+      wheel-sha256: ${{ steps.out.outputs.wheel-sha256 }}
+    env:
+      SDIST: ${{ needs.build-sdist.outputs.sdist-name }}
+      SDIST_SHA256: ${{ needs.build-sdist.outputs.sdist-sha256 }}
+      SOURCE_DATE_EPOCH: ${{ needs.build-sdist.outputs.source-date-epoch }}
+      LOCK_SHA256: ${{ needs.build-sdist.outputs.lock-sha256 }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdist
+          path: dist
+      # Proves: the sdist is the one build-sdist digested.
+      - name: Check the sdist digest
+        run: echo "$SDIST_SHA256  dist/$SDIST" | sha256sum -c -
+      # Proves: the sdist was built by this repo's build.yml from the tagged commit, on a GitHub-hosted runner.
+      - name: Verify the sdist attestation
+        if: inputs.attest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "dist/$SDIST" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build.yml" \
+            --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      # Proves: the lock the sdist carries is the one build-sdist's lock step generated, before any build dependency ran.
+      - name: Build the wheel from the sdist alone, with the lock it carries
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # ---- The lock inside the sdist is the one build-sdist generated ----
+
+          # Catches a build backend that rewrote the lock inside the sdist (a "laundered" build environment).
+          tar -xzOf "dist/$SDIST" "${SDIST%.tar.gz}/build-constraints.txt" > "$RUNNER_TEMP/build-constraints.txt"
+          echo "$LOCK_SHA256  $RUNNER_TEMP/build-constraints.txt" | sha256sum -c - \
+            || fail "the lock inside the sdist is not the lock build-sdist generated"
+
+          # ---- Build the wheel from the sdist alone (no checkout), every build dependency hash-checked ----
+
+          # First third-party code in this job.
+          uv build --wheel "dist/$SDIST" --out-dir wheelhouse --python "$PYTHON_VERSION" \
+            --build-constraints "$RUNNER_TEMP/build-constraints.txt" --require-hashes
+      - name: Outputs
+        id: out
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          shopt -s nullglob
+          wheels=(wheelhouse/*.whl)
+          [ "${#wheels[@]}" -eq 1 ] || fail "expected exactly one wheel"
+          WHEEL=${wheels[0]##*/}
+
+          wheel_sha256=$(sha256sum "wheelhouse/$WHEEL" | cut -d' ' -f1)
+          echo "wheel-name=$WHEEL" >> "$GITHUB_OUTPUT"
+          echo "wheel-sha256=$wheel_sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel
+          path: wheelhouse/${{ steps.out.outputs.wheel-name }}
+          if-no-files-found: error
+
+  attest-wheel:
+    needs: build-wheel
+    if: inputs.attest
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+    outputs:
+      bundle-sha256: ${{ steps.bundle.outputs.bundle-sha256 }}
+    env:
+      ARTIFACT: wheel
+      FILE: ${{ needs.build-wheel.outputs.wheel-name }}
+      SHA256: ${{ needs.build-wheel.outputs.wheel-sha256 }}
+    steps: *attest-steps
+
+  # A CycloneDX SBOM of the release: the package, both distributions with their SHA-256, its runtime requirements,
+  # and the build lock. Runs a pinned third-party tool (cyclonedx-py), so it holds no permission at all.
+  sbom:
+    needs: [build-sdist, build-wheel]
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      sbom-sha256: ${{ steps.sbom.outputs.sbom-sha256 }}
+    env:
+      SDIST: ${{ needs.build-sdist.outputs.sdist-name }}
+      SDIST_SHA256: ${{ needs.build-sdist.outputs.sdist-sha256 }}
+      WHEEL: ${{ needs.build-wheel.outputs.wheel-name }}
+      WHEEL_SHA256: ${{ needs.build-wheel.outputs.wheel-sha256 }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdist
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel
+          path: dist
+      # Proves: the sdist and wheel are the ones the build jobs digested.
+      - name: Check digests
+        run: printf '%s  dist/%s\n' "$SDIST_SHA256" "$SDIST" "$WHEEL_SHA256" "$WHEEL" | sha256sum -c -
+      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Generate the CycloneDX SBOM
+        id: sbom
+        run: |
+          mkdir sbom
+
+          # ---- Inputs: the lock from the sdist, the METADATA from the wheel ----
+
+          tar -xzOf "dist/$SDIST" "${SDIST%.tar.gz}/build-constraints.txt" > "$RUNNER_TEMP/build-constraints.txt"
+          unzip -p "dist/$WHEEL" '*.dist-info/METADATA' > "$RUNNER_TEMP/METADATA"
+
+          # ---- The build lock as CycloneDX components (pinned tool) ----
+
+          uvx --python "$PYTHON_VERSION" --exclude-newer "$TOOLS_EXCLUDE_NEWER" --from "$CYCLONEDX_BOM" \
+            cyclonedx-py requirements --of JSON --sv 1.6 --output-reproducible \
+            -o "$RUNNER_TEMP/lock.cdx.json" "$RUNNER_TEMP/build-constraints.txt"
+
+          # ---- Add the root component (both dist hashes) and the runtime requirements; mark the lock build-only ----
+
+          uv run --no-project --python "$PYTHON_VERSION" python -I - <<'PY'
+          import email.parser, json, os
+
+          tmp = os.environ["RUNNER_TEMP"]
+          metadata = email.parser.Parser().parse(open(f"{tmp}/METADATA"))
+          name, version = metadata["Name"], metadata["Version"]
+          bom = json.load(open(f"{tmp}/lock.cdx.json"))
+
+          # Build lock: CycloneDX has no "build" scope; "excluded" = not part of the runtime.
+          for component in bom.get("components", []):
+              component["scope"] = "excluded"
+              component.setdefault("properties", []).append({"name": "release-pipeline:scope", "value": "build"})
+
+          # Runtime requirements (Requires-Dist): unversioned, the requirement string kept as a property.
+          for i, requirement in enumerate(metadata.get_all("Requires-Dist") or []):
+              dependency = requirement.split(";")[0].strip()
+              bare_name = dependency.split("[")[0]
+              for operator in "<>=!~ (":
+                  bare_name = bare_name.split(operator)[0]
+              bom["components"].append({
+                  "type": "library",
+                  "bom-ref": f"runtime-{i}",
+                  "name": bare_name,
+                  "scope": "required",
+                  "purl": f"pkg:pypi/{bare_name.lower().replace('_', '-')}",
+                  "properties": [{"name": "release-pipeline:requirement", "value": requirement}],
+              })
+
+
+          def distribution(filename, sha256):
+              return {
+                  "type": "distribution",
+                  "url": f"https://pypi.org/project/{name}/{version}/#files",
+                  "comment": filename,
+                  "hashes": [{"alg": "SHA-256", "content": sha256}],
+              }
+
+
+          # Root component: the package itself, with both distributions.
+          bom.setdefault("metadata", {})["component"] = {
+              "type": "library",
+              "bom-ref": "root",
+              "name": name,
+              "version": version,
+              "purl": f"pkg:pypi/{name.lower().replace('_', '-')}@{version}",
+              "externalReferences": [
+                  distribution(os.environ["SDIST"], os.environ["SDIST_SHA256"]),
+                  distribution(os.environ["WHEEL"], os.environ["WHEEL_SHA256"]),
+              ],
+          }
+          json.dump(bom, open("sbom/sbom.cdx.json", "w"), indent=2, sort_keys=True)
+          PY
+
+          sbom_sha256=$(sha256sum sbom/sbom.cdx.json | cut -d' ' -f1)
+          echo "sbom-sha256=$sbom_sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom/sbom.cdx.json
+          if-no-files-found: error
+
+  attest-sbom:
+    needs: sbom
+    if: inputs.attest
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+    outputs:
+      bundle-sha256: ${{ steps.bundle.outputs.bundle-sha256 }}
+    env:
+      ARTIFACT: sbom
+      FILE: sbom.cdx.json
+      SHA256: ${{ needs.sbom.outputs.sbom-sha256 }}
+    steps: *attest-steps

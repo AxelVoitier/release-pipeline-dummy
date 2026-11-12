@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "release-pipeline-dummy"
+dynamic = ["version"]
+description = "Near-empty package used to validate the secure release pipeline template."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["packaging>=24"]  # one runtime dep: exercises verify's two-step install
+
+[tool.hatch.version]
+source = "vcs"
+# ADAPT: VCS-versioned project with no tag yet -> CI on a full clone still builds.
+fallback-version = "0.0.0"
+
+# [tool.release-pipeline]
+# build-cooldown-days = 7   # default 7; 0 allowed with a warning

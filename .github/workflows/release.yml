@@ -1,0 +1,670 @@
+# Secure tag-triggered release: signed tag -> build + attest -> TestPyPI -> verify -> [approval] -> PyPI -> verify -> GitHub release.
+# Spec: .scratch/secure-pypi-publish/spec.md. Every element is INV (do not touch) unless the spec marks it ADAPT.
+# Privilege split: jobs that may run third-party code hold no credential/write permission; jobs that do never run package code.
+#
+# Reading guide: each check step carries a "# Proves:" line (the claim it establishes); long steps are cut into
+# "# ---- <claim> ----" divisions. Every check fails through `fail`, which prints a ::error:: annotation and stops the step.
+# Commands that fail on their own (git, gh, curl, sha256sum -c) stop the step too: bash runs with -e and pipefail.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # same-tag runs queue; never cancel mid-publish
+
+defaults:
+  run:
+    shell: bash # bash -eo pipefail
+
+env:
+  # Hand-bumped pins (Dependabot does not see these). Keep in sync with build.yml.
+  PYTHON_VERSION: "3.14.6"
+  UV_VERSION: "0.11.32"
+  TOOLS_EXCLUDE_NEWER: "2026-11-01T00:00:00Z"
+  PYPI_ATTESTATIONS: "pypi-attestations==0.0.30"
+  UV_NO_CONFIG: "1"
+
+jobs:
+  # Proves, before anything is built: the tag is a well-formed release tag, signed by a pinned signer under its own
+  # name, on the default branch; the repo's protections are in place; CI passed on the tagged commit.
+  # Runs no package code: the checkout is git objects only.
+  origin-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      # Proves: the tag is v + a canonical PEP 440 version (no local part).
+      - name: Validate the tag (canonical PEP 440, no local part)
+        id: tag
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          [[ "$GITHUB_REF" == refs/tags/v* ]] || fail "not a v* tag push"
+
+          # Canonical form only, so the built version can be compared to it as a plain string.
+          VERSION=${TAG#v}
+          CANONICAL_PEP440='([1-9][0-9]*!)?(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))*((a|b|rc)(0|[1-9][0-9]*))?(\.post(0|[1-9][0-9]*))?(\.dev(0|[1-9][0-9]*))?'
+          grep -Eqx "$CANONICAL_PEP440" <<<"$VERSION" || fail "tag '$TAG' is not v + a canonical PEP 440 version"
+
+          # aN / bN / rcN / .devN make a GitHub pre-release.
+          PRERELEASE=false
+          if grep -Eq '(a|b|rc)[0-9]+|\.dev[0-9]+' <<<"$VERSION"; then PRERELEASE=true; fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      # Git objects only: the working tree is limited to .github/ and nothing from the checkout is executed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - name: Check the tag is annotated, points to the built commit, and is on the default branch
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # ---- Tag is annotated, names itself, and points to the built commit ----
+
+          object_type=$(git cat-file -t "refs/tags/$TAG")
+          [ "$object_type" = tag ] || fail "$TAG is a lightweight tag; release tags must be annotated and signed"
+
+          # git verify-tag does not check the name: a signed object replayed under another ref would verify.
+          object_name=$(git cat-file tag "refs/tags/$TAG" | sed -n '/^$/q; s/^tag //p')
+          [ "$object_name" = "$TAG" ] || fail "the tag object inside refs/tags/$TAG is named '$object_name' (replayed signed tag)"
+
+          # Every later job builds and publishes $GITHUB_SHA.
+          tagged_commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          [ "$tagged_commit" = "$GITHUB_SHA" ] || fail "$TAG now points to $tagged_commit, not $GITHUB_SHA"
+
+          # ---- Tagged commit is on the default branch ----
+
+          # Releases come from reviewed history.
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH" \
+            || fail "$GITHUB_SHA is not on the default branch ($DEFAULT_BRANCH)"
+
+      # Proves: the signer files on the default branch match RELEASE_SIGNERS_SHA256.
+      - name: Check the signer files against RELEASE_SIGNERS_SHA256
+        env:
+          RELEASE_SIGNERS_SHA256: ${{ vars.RELEASE_SIGNERS_SHA256 }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # Changing the trusted keys takes push (the files) and admin (the variable).
+          [ -n "$RELEASE_SIGNERS_SHA256" ] || fail "repository variable RELEASE_SIGNERS_SHA256 is not set"
+
+          # The signer files, read from the default branch (not from the tagged commit).
+          mapfile -t present < <(git ls-tree --name-only "origin/$DEFAULT_BRANCH" .github/ | grep '^\.github/release-signers' || true)
+          [ "${#present[@]}" -gt 0 ] || fail "no .github/release-signers(.asc) on $DEFAULT_BRANCH"
+
+          SIGNERS="$RUNNER_TEMP/signers"
+          mkdir -p "$SIGNERS/.github"
+          for file in "${present[@]}"; do
+            case "$file" in
+              .github/release-signers | .github/release-signers.asc) ;;
+              *) fail "unexpected signer file $file" ;;
+            esac
+            git show "origin/$DEFAULT_BRANCH:$file" > "$SIGNERS/$file"
+          done
+
+          # The variable holds sha256sum lines: it must list exactly the files present, and their hashes must match.
+          printf '%s\n' "$RELEASE_SIGNERS_SHA256" | tr -d '\r' | sed '/^$/d' > "$RUNNER_TEMP/signers.sha256"
+          listed_files=$(awk '{sub(/^\*/, "", $2); print $2}' "$RUNNER_TEMP/signers.sha256" | sort)
+          present_files=$(printf '%s\n' "${present[@]}" | sort)
+          [ "$listed_files" = "$present_files" ] \
+            || fail "signer files on $DEFAULT_BRANCH and RELEASE_SIGNERS_SHA256 do not list the same files"
+          (cd "$SIGNERS" && sha256sum --strict -c "$RUNNER_TEMP/signers.sha256")
+
+      # Proves: the tag signature is valid and was made by a pinned signer.
+      - name: Verify the tag signature against the pinned signers
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          SIGNERS="$RUNNER_TEMP/signers/.github"
+          SSH_SIGNERS=/dev/null
+          if [ -f "$SIGNERS/release-signers" ]; then SSH_SIGNERS="$SIGNERS/release-signers"; fi
+
+          # Nothing comes from the runner's git config: both programs and the SSH allow-list are pinned, in both branches.
+          GIT_VERIFY=(git -c gpg.program=gpg -c gpg.ssh.program=ssh-keygen -c gpg.ssh.allowedSignersFile="$SSH_SIGNERS")
+
+          # An empty keyring: the only GPG keys are the pinned ones imported below.
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+
+          # The signature type is the LAST armor header, as git reads it: a marker quoted in the message can't pick the branch.
+          armor=$(git cat-file tag "refs/tags/$TAG" | grep -E '^-----BEGIN (SSH|PGP) SIGNATURE-----$' | tail -n1 || true)
+
+          case "$armor" in
+            '-----BEGIN SSH SIGNATURE-----')
+              [ -f "$SIGNERS/release-signers" ] || fail "SSH-signed tag but no .github/release-signers"
+              # An unknown key fails with "No principal matched".
+              "${GIT_VERIFY[@]}" verify-tag "$TAG"
+              ;;
+            '-----BEGIN PGP SIGNATURE-----')
+              [ -f "$SIGNERS/release-signers.asc" ] || fail "GPG-signed tag but no .github/release-signers.asc"
+              gpg --batch --quiet --import "$SIGNERS/release-signers.asc"
+              if ! status=$("${GIT_VERIFY[@]}" verify-tag --raw "$TAG" 2>&1); then
+                echo "$status"
+                fail "tag signature invalid"
+              fi
+              echo "$status"
+              grep -q '^\[GNUPG:\] VALIDSIG ' <<<"$status" || fail "no VALIDSIG"
+              if grep -Eq '^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG|EXPSIG) ' <<<"$status"; then
+                fail "expired, revoked or bad signature/key"
+              fi
+              ;;
+            *)
+              fail "$TAG is not signed (GPG or SSH required)"
+              ;;
+          esac
+
+      # Re-run verbatim by publish-pypi (YAML anchor; local act runs expand a copy with local-test/expand_anchors.py).
+      # Proves: testpypi and pypi accept only v* tags; pypi requires a reviewer and admins can't bypass it.
+      - &check-envs
+        name: Check the testpypi and pypi environment protections
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # A deleted environment is silently recreated WITHOUT protection rules, and the trusted publishers match only
+          # the environment name: so check both environments on every release, not once at setup.
+          API="repos/$GITHUB_REPOSITORY/environments"
+
+          # ---- testpypi and pypi accept exactly the v* tag deployment policy ----
+
+          # So a branch copy of release.yml can deploy to neither.
+          for environment in testpypi pypi; do
+            env_json=$(gh api "$API/$environment") || fail "environment $environment not readable or missing"
+            jq -e '.deployment_branch_policy.custom_branch_policies == true' <<<"$env_json" >/dev/null \
+              || fail "environment $environment has no custom deployment tag policy"
+
+            policies_json=$(gh api "$API/$environment/deployment-branch-policies")
+            jq -e '(.branch_policies | length) > 0
+                   and all(.branch_policies[]; .type == "tag" and .name == "v*")' <<<"$policies_json" >/dev/null \
+              || fail "environment $environment must allow exactly the v* tag policy"
+          done
+
+          # ---- pypi carries the approval gate: required reviewers, no admin bypass ----
+
+          pypi_json=$(gh api "$API/pypi")
+          jq -e '[.protection_rules[]?
+                  | select(.type == "required_reviewers" and ((.reviewers // []) | length) > 0)]
+                 | length > 0' <<<"$pypi_json" >/dev/null \
+            || fail "environment pypi has no required reviewers"
+          jq -e '.can_admins_bypass != true' <<<"$pypi_json" >/dev/null \
+            || fail "environment pypi allows administrators to bypass"
+
+      # Proves: active v* tag rulesets restrict creation and block update, deletion and force-push.
+      - name: Check the v* tag rulesets exist
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # Every active tag ruleset, including organisation ones, fetched in full (the list omits the rules).
+          API="repos/$GITHUB_REPOSITORY/rulesets"
+          ruleset_ids=$(gh api "$API?includes_parents=true" --paginate \
+            --jq '.[] | select(.target == "tag" and .enforcement == "active") | .id')
+          rulesets_json=$(for id in $ruleset_ids; do gh api "$API/$id"; done | jq -s .)
+
+          # Those whose include list names refs/tags/v*.
+          v_rulesets=$(jq '[.[] | select((.conditions.ref_name.include // []) | index("refs/tags/v*"))]' <<<"$rulesets_json")
+
+          # Bypass lists are not checked yet (decided after the first real run).
+          jq -e 'any(.[]; any(.rules[]; .type == "creation"))' <<<"$v_rulesets" >/dev/null \
+            || fail "no active v* tag ruleset restricts creation"
+          jq -e 'def has_rule($t): any(.rules[]; .type == $t);
+                 any(.[]; has_rule("update") and has_rule("deletion") and has_rule("non_fast_forward"))' \
+                 <<<"$v_rulesets" >/dev/null \
+            || fail "no active v* tag ruleset blocks update + deletion + force-push"
+
+      # Last, so the cheap checks above fail fast. Actions has no cross-workflow needs:, so poll.
+      # Proves: CI passed on the tagged commit, and at least one of its runs used build.yml.
+      - name: Wait for CI on the tagged commit (all green, at least one run uses build.yml)
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          API="repos/$GITHUB_REPOSITORY/actions/runs"
+          BUILD_YML="$GITHUB_REPOSITORY/.github/workflows/build.yml@"
+          deadline=$((SECONDS + 3600))
+
+          while :; do
+            # Runs started by this tag push (not branch pushes of the same commit), except this release run.
+            runs_json=$(gh api "$API?head_sha=$GITHUB_SHA&event=push&per_page=100" --paginate \
+              --jq ".workflow_runs[] | select(.id != $RUN_ID and .head_branch == env.TAG)" | jq -s .)
+
+            # Any completed run that did not succeed stops the release at once.
+            failed=$(jq -r '[.[] | select(.status == "completed" and .conclusion != "success")
+                             | "\(.name) (\(.conclusion)) \(.html_url)"] | join(", ")' <<<"$runs_json")
+            [ -z "$failed" ] || fail "CI did not pass on $GITHUB_SHA: $failed"
+
+            total=$(jq length <<<"$runs_json")
+            pending=$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs_json")
+            using_build=$(jq --arg p "$BUILD_YML" \
+              '[.[] | select(any(.referenced_workflows[]?; .path | startswith($p)))] | length' <<<"$runs_json")
+            echo "runs=$total pending=$pending using-build.yml=$using_build"
+
+            if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ] && [ "$using_build" -gt 0 ]; then break; fi
+            [ "$SECONDS" -lt "$deadline" ] || fail "timed out after 60 min waiting for CI on $GITHUB_SHA"
+            sleep 30
+          done
+
+  # build-sdist -> attest-sdist -> build-wheel -> attest-wheel; sbom -> attest-sbom. Each inner job narrows these grants.
+  build:
+    needs: origin-check
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    with:
+      attest: true
+      expected-version: ${{ needs.origin-check.outputs.version }}
+
+  # Uploads exactly the built bytes to TestPyPI through the trusted publisher, with PEP 740 attestations.
+  # Holds the OIDC token, so it runs no package code and has no checkout.
+  publish-testpypi:
+    needs: [origin-check, build]
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.origin-check.outputs.version }}
+      SDIST: ${{ needs.build.outputs.sdist-name }}
+      SDIST_SHA256: ${{ needs.build.outputs.sdist-sha256 }}
+      WHEEL: ${{ needs.build.outputs.wheel-name }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
+      INDEX: https://test.pypi.org
+      UPLOAD_URL: https://test.pypi.org/legacy/
+    steps:
+      # Proves: the tag still points to the commit that was built (catches a tag moved or recreated since origin-check).
+      - &check-tag
+        name: Check the tag still points to the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # Through the API (no checkout here). An annotated tag's ref points to a tag object: peel it to the commit.
+          API="repos/$GITHUB_REPOSITORY/git"
+          ref_json=$(gh api "$API/ref/tags/$GITHUB_REF_NAME")
+          target_type=$(jq -r .object.type <<<"$ref_json")
+          target_sha=$(jq -r .object.sha <<<"$ref_json")
+          if [ "$target_type" = tag ]; then
+            target_sha=$(gh api "$API/tags/$target_sha" --jq .object.sha)
+          fi
+          [ "$target_sha" = "$GITHUB_SHA" ] || fail "$GITHUB_REF_NAME now points to $target_sha, not the built $GITHUB_SHA"
+      # sdist and wheel only: the publish action uploads everything in its folder, so the bundles stay out.
+      - &dl-sdist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdist
+          path: dist
+      - &dl-wheel
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel
+          path: dist
+      # Proves: the downloaded files are the bytes the build jobs digested (artifacts are writable by untrusted jobs).
+      - &check-dists
+        name: Check digests against the build job outputs
+        run: printf '%s  dist/%s\n' "$SDIST_SHA256" "$SDIST" "$WHEEL_SHA256" "$WHEEL" | sha256sum -c -
+      # Never skip-existing (it matches filenames, not hashes): absent -> upload, same sha256 -> skip, different -> fail.
+      # Proves: no file of this version on the index differs from ours; selects which files still need uploading.
+      - &hash-rule
+        name: Apply the hash rule against the index
+        id: rule
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          # The JSON API for this exact version: 200 = some files exist, 404 = none yet, anything else = can't tell.
+          NAME=${SDIST%-"$VERSION".tar.gz}
+          http_code=$(curl -sSL -o "$RUNNER_TEMP/index.json" -w '%{http_code}' "$INDEX/pypi/$NAME/$VERSION/json" || true)
+          case "$http_code" in
+            200 | 404) ;;
+            *) fail "$INDEX JSON API returned HTTP $http_code" ;;
+          esac
+
+          # Per file, so a re-run after a half-finished upload sends only the missing file.
+          # An index never lets a filename be reused: a different sha256 can only be fixed with a new tag.
+          mkdir upload
+          for file in "$SDIST" "$WHEEL"; do
+            index_sha256=""
+            if [ "$http_code" = 200 ]; then
+              index_sha256=$(jq -r --arg f "$file" '.urls[] | select(.filename == $f) | .digests.sha256' "$RUNNER_TEMP/index.json")
+            fi
+            built_sha256=$(sha256sum "dist/$file" | cut -d' ' -f1)
+
+            if [ -z "$index_sha256" ]; then
+              mv "dist/$file" upload/
+              echo "$file: upload"
+            elif [ "$index_sha256" = "$built_sha256" ]; then
+              echo "$file: already on the index with the same sha256, skipped"
+            else
+              fail "$file is on the index with a different sha256 ($index_sha256); a new tag is needed"
+            fi
+          done
+
+          if [ -n "$(ls upload)" ]; then upload=true; else upload=false; fi
+          echo "upload=$upload" >> "$GITHUB_OUTPUT"
+      - &publish
+        name: Publish (trusted publishing, PEP 740 attestations on)
+        if: steps.rule.outputs.upload == 'true'
+        # TODO-PIN: pin the latest release by full SHA before the first real run; must be >= v1.11.0 (PEP 740 attestations on by default).
+        uses: pypa/gh-action-pypi-publish@0000000000000000000000000000000000000000 # vX.Y.Z TODO-PIN
+        with:
+          repository-url: ${{ env.UPLOAD_URL }}
+          packages-dir: upload/
+          attestations: true # explicit: PEP 740 is what verify-* checks; never turn off
+
+  # Proves the index serves exactly the built bytes, built by build.yml (GitHub attestation) and uploaded by our trusted
+  # publisher (PEP 740), and that the wheel installs with its dependencies.
+  verify-testpypi:
+    needs: [origin-check, build, publish-testpypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      VERSION: ${{ needs.origin-check.outputs.version }}
+      SDIST: ${{ needs.build.outputs.sdist-name }}
+      SDIST_SHA256: ${{ needs.build.outputs.sdist-sha256 }}
+      WHEEL: ${{ needs.build.outputs.wheel-name }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
+      INDEX: https://test.pypi.org
+      EXPECTED_ENVIRONMENT: testpypi
+    # Shared verbatim with verify-pypi (YAML anchor). Every check mandatory; no hooks, no knobs.
+    # Trust order: steps up to "Fetch the PEP 740 provenance" run only runner tools and pinned actions; from the
+    # pypi-attestations call on, third-party code runs (a runner has passwordless sudo), so nothing after it is trusted
+    # to produce evidence: digests that leave this job are computed before it.
+    steps: &verify-steps
+      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v10.3.2 TODO-PIN: resolve the full SHA before first real run
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Install Python
+        run: uv python install "$PYTHON_VERSION"
+      # Proves: the index's JSON API lists both files for this version.
+      - name: Wait until the index lists both files
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          NAME=${SDIST%-"$VERSION".tar.gz}
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+          # Uploads take a moment to appear: poll with backoff (5 s, doubling up to 60 s), 10 min at most.
+          deadline=$((SECONDS + 600))
+          delay=5
+          until curl -sSfL -o "$RUNNER_TEMP/index.json" "$INDEX/pypi/$NAME/$VERSION/json" \
+              && jq -e --arg s "$SDIST" --arg w "$WHEEL" '[.urls[].filename] | index($s) and index($w)' \
+                   "$RUNNER_TEMP/index.json" >/dev/null; do
+            [ "$SECONDS" -lt "$deadline" ] || fail "$SDIST / $WHEEL not visible on $INDEX after 10 min; re-run this job"
+            sleep "$delay"
+            delay=$(( delay < 60 ? delay * 2 : 60 ))
+          done
+      # Proves: build job output = index digest = bytes served, for both files (downloaded by exact filename).
+      - name: Download by exact filename, three-way sha256 match (job output = index = bytes)
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          mkdir dl
+          for pair in "$SDIST $SDIST_SHA256" "$WHEEL $WHEEL_SHA256"; do
+            read -r file built_sha256 <<<"$pair"
+            index_sha256=$(jq -r --arg f "$file" '.urls[] | select(.filename == $f) | .digests.sha256' "$RUNNER_TEMP/index.json")
+            url=$(jq -r --arg f "$file" '.urls[] | select(.filename == $f) | .url' "$RUNNER_TEMP/index.json")
+
+            # The index lists the digest the build job reported...
+            [ "$index_sha256" = "$built_sha256" ] || fail "$file: index sha256 $index_sha256 != built $built_sha256"
+
+            # ...and serves those bytes.
+            curl -sSfL -o "dl/$file" "$url"
+            echo "$built_sha256  dl/$file" | sha256sum -c -
+          done
+      # Proves: both files were built by this repo's build.yml from the tagged commit, on a GitHub-hosted runner.
+      - name: Verify the GitHub build attestations
+        env:
+          GH_TOKEN: ${{ github.token }} # step-scoped: third-party code in later steps must not find it in env
+        run: |
+          for file in "$SDIST" "$WHEEL"; do
+            gh attestation verify "dl/$file" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          done
+      # Proves: every PEP 740 attestation names our trusted publisher (this repo, release.yml, the expected environment);
+      # records the provenance digests before any third-party code runs in this job.
+      - name: Fetch the PEP 740 provenance, check the publisher (repo, workflow, environment), record its digest
+        id: provenance
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          mkdir prov
+          for kind in sdist wheel; do
+            if [ "$kind" = sdist ]; then file=$SDIST; else file=$WHEEL; fi
+            provenance="prov/$file.pypi-provenance.json"
+            curl -sSfL -H 'Accept: application/vnd.pypi.integrity.v1+json' \
+              -o "$provenance" "$INDEX/integrity/$NAME/$VERSION/$file/provenance"
+
+            jq -e --arg r "$GITHUB_REPOSITORY" --arg e "$EXPECTED_ENVIRONMENT" \
+              '(.attestation_bundles | length) > 0
+               and all(.attestation_bundles[].publisher;
+                       .kind == "GitHub" and .repository == $r and .workflow == "release.yml" and .environment == $e)' \
+              "$provenance" >/dev/null \
+              || fail "$file: provenance publisher is not $GITHUB_REPOSITORY / release.yml / $EXPECTED_ENVIRONMENT"
+
+            # github-release checks the pypi-provenance artifact against this digest.
+            provenance_sha256=$(sha256sum "$provenance" | cut -d' ' -f1)
+            echo "$kind-provenance-sha256=$provenance_sha256" >> "$GITHUB_OUTPUT"
+          done
+      # First third-party code in this job (a pinned tool doing this step's job): nothing after this produces evidence.
+      # Proves: the PEP 740 signatures are valid for the downloaded files.
+      - name: Verify the PEP 740 provenance signatures
+        run: |
+          for file in "$SDIST" "$WHEEL"; do
+            uvx --python "$PYTHON_VERSION" --exclude-newer "$TOOLS_EXCLUDE_NEWER" --from "$PYPI_ATTESTATIONS" \
+              pypi-attestations verify pypi --repository "https://github.com/$GITHUB_REPOSITORY" \
+              --provenance-file "prov/$file.pypi-provenance.json" "dl/$file"
+          done
+      # Proves: the wheel installs (hash-pinned, from the index under test) with its dependencies from PyPI, consistently.
+      - name: Install the hash-pinned wheel from the index under test, dependencies from PyPI only
+        run: |
+          uv run --no-project --python "$PYTHON_VERSION" python -m venv "$RUNNER_TEMP/venv"
+          PIP="$RUNNER_TEMP/venv/bin/pip"
+
+          # --isolated: no PIP_* env; PIP_CONFIG_FILE=/dev/null: no pip.conf at any level. Only the index given here is used.
+          export PIP_CONFIG_FILE=/dev/null
+
+          # The wheel alone, by hash, from the index under test.
+          printf '%s==%s --hash=sha256:%s\n' "$NAME" "$VERSION" "$WHEEL_SHA256" > "$RUNNER_TEMP/req.txt"
+          "$PIP" --isolated install --index-url "$INDEX/simple" --no-deps --only-binary :all: --require-hashes -r "$RUNNER_TEMP/req.txt"
+
+          # Its dependencies from PyPI only, as wheels, so this job runs no package code (documented reversal: drop
+          # --only-binary here for a runtime dependency that ships only an sdist; its build then runs in this job).
+          "$PIP" --isolated install --index-url https://pypi.org/simple --only-binary :all: "$NAME==$VERSION"
+
+          "$PIP" --isolated check
+      - name: Hand the verified provenance to github-release
+        if: env.EXPECTED_ENVIRONMENT == 'pypi'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pypi-provenance
+          path: prov/
+          if-no-files-found: error
+
+  # The approval gate, then the same steps as publish-testpypi against PyPI, after re-checking the environments.
+  publish-pypi:
+    needs: [origin-check, build, verify-testpypi]
+    runs-on: ubuntu-latest
+    environment: pypi # APPROVAL GATE: required reviewers, no admin bypass, v* tag policy
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.origin-check.outputs.version }}
+      SDIST: ${{ needs.build.outputs.sdist-name }}
+      SDIST_SHA256: ${{ needs.build.outputs.sdist-sha256 }}
+      WHEEL: ${{ needs.build.outputs.wheel-name }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
+      INDEX: https://pypi.org
+      UPLOAD_URL: https://upload.pypi.org/legacy/
+    steps:
+      - *check-envs
+      - *check-tag
+      - *dl-sdist
+      - *dl-wheel
+      - *check-dists
+      - *hash-rule
+      - *publish
+  # As verify-testpypi, against PyPI; also hands the verified provenance to github-release.
+  verify-pypi:
+    needs: [origin-check, build, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      VERSION: ${{ needs.origin-check.outputs.version }}
+      SDIST: ${{ needs.build.outputs.sdist-name }}
+      SDIST_SHA256: ${{ needs.build.outputs.sdist-sha256 }}
+      WHEEL: ${{ needs.build.outputs.wheel-name }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
+      INDEX: https://pypi.org
+      EXPECTED_ENVIRONMENT: pypi
+    outputs: # what github-release checks the pypi-provenance artifact against
+      sdist-provenance-sha256: ${{ steps.provenance.outputs.sdist-provenance-sha256 }}
+      wheel-provenance-sha256: ${{ steps.provenance.outputs.wheel-provenance-sha256 }}
+    steps: *verify-steps
+
+  # Publishes the GitHub release with all eight assets, each checked against the digest of the job that made it.
+  # Administrative: re-runnable; notes are not checked. contents: write only, no checkout, no package code.
+  github-release:
+    needs: [origin-check, build, verify-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      PRERELEASE: ${{ needs.origin-check.outputs.prerelease }}
+      SDIST: ${{ needs.build.outputs.sdist-name }}
+      SDIST_SHA256: ${{ needs.build.outputs.sdist-sha256 }}
+      WHEEL: ${{ needs.build.outputs.wheel-name }}
+      WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
+      SBOM_SHA256: ${{ needs.build.outputs.sbom-sha256 }}
+      # Every artifact is checked against a digest produced by the job that made it, before any third-party code ran
+      # there: untrusted jobs keep artifact write access (the runtime token ignores permissions:).
+      BUNDLE_SDIST_SHA256: ${{ needs.build.outputs.bundle-sdist-sha256 }}
+      BUNDLE_WHEEL_SHA256: ${{ needs.build.outputs.bundle-wheel-sha256 }}
+      BUNDLE_SBOM_SHA256: ${{ needs.build.outputs.bundle-sbom-sha256 }}
+      SDIST_PROVENANCE_SHA256: ${{ needs.verify-pypi.outputs.sdist-provenance-sha256 }}
+      WHEEL_PROVENANCE_SHA256: ${{ needs.verify-pypi.outputs.wheel-provenance-sha256 }}
+    steps:
+      # Exact names, one folder per artifact (no merge): a planted extra artifact is never read.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{sdist,wheel,sbom,bundle-sdist,bundle-wheel,bundle-sbom,pypi-provenance}"
+          path: in
+      # Proves: each of the eight assets is the file its producing job digested.
+      - name: Check every asset against the producing jobs' digests
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          mkdir assets
+          while read -r artifact file expected_sha256; do
+            [ -n "$expected_sha256" ] || fail "no digest output for $artifact/$file"
+            echo "$expected_sha256  in/$artifact/$file" | sha256sum -c -
+            cp "in/$artifact/$file" assets/
+          done <<EOF
+          sdist $SDIST $SDIST_SHA256
+          wheel $WHEEL $WHEEL_SHA256
+          sbom sbom.cdx.json $SBOM_SHA256
+          bundle-sdist $SDIST.sigstore.json $BUNDLE_SDIST_SHA256
+          bundle-wheel $WHEEL.sigstore.json $BUNDLE_WHEEL_SHA256
+          bundle-sbom sbom.cdx.json.sigstore.json $BUNDLE_SBOM_SHA256
+          pypi-provenance $SDIST.pypi-provenance.json $SDIST_PROVENANCE_SHA256
+          pypi-provenance $WHEEL.pypi-provenance.json $WHEEL_PROVENANCE_SHA256
+          EOF
+      - name: Create or complete the release (draft -> assets -> tag check -> publish)
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          API="repos/$GITHUB_REPOSITORY"
+          expected=(sbom.cdx.json "$SDIST" "$WHEEL" "$SDIST.sigstore.json" "$WHEEL.sigstore.json"
+                    sbom.cdx.json.sigstore.json "$SDIST.pypi-provenance.json" "$WHEEL.pypi-provenance.json")
+
+          # ---- All eight assets are present ----
+
+          for asset in "${expected[@]}"; do
+            [ -f "assets/$asset" ] || fail "missing asset $asset"
+          done
+
+          # ---- At most one release exists for the tag, and it carries no unexpected asset ----
+
+          releases_json=$(gh api "$API/releases" --paginate --jq '.[] | select(.tag_name == env.TAG)' | jq -s .)
+          release_count=$(jq length <<<"$releases_json")
+          [ "$release_count" -le 1 ] || fail "several releases exist for $TAG; delete the extra drafts"
+
+          release_json=$(jq 'first // empty' <<<"$releases_json")
+          if [ -n "$release_json" ]; then
+            extra=$(jq -r --args '[.assets[].name] - $ARGS.positional | join(", ")' "${expected[@]}" <<<"$release_json")
+            [ -z "$extra" ] || fail "the release for $TAG carries assets outside the expected set: $extra"
+          fi
+
+          # ---- Already published: assets identical, nothing to do (notes never touched) ----
+
+          if [ -n "$release_json" ] && [ "$(jq -r .draft <<<"$release_json")" = false ]; then
+            for asset in "${expected[@]}"; do
+              published_digest=$(jq -r --arg a "$asset" '.assets[] | select(.name == $a) | .digest // ""' <<<"$release_json")
+              local_sha256=$(sha256sum "assets/$asset" | cut -d' ' -f1)
+              [ "$published_digest" = "sha256:$local_sha256" ] \
+                || fail "published release asset $asset differs or is missing ($published_digest)"
+            done
+            echo "release already published with identical assets"
+            exit 0
+          fi
+
+          # ---- Otherwise: draft (a prepared one keeps its notes), upload, tag still on the built commit, publish ----
+
+          if [ -z "$release_json" ]; then
+            # Notes are administrative text: a draft prepared for the tag keeps its body; otherwise the body stays empty.
+            release_json=$(gh api -X POST "$API/releases" -f tag_name="$TAG" -f name="$TAG" -F draft=true -F prerelease="$PRERELEASE")
+          fi
+          RELEASE_ID=$(jq -r .id <<<"$release_json")
+
+          (cd assets && gh release upload "$TAG" "${expected[@]}" --clobber --repo "$GITHUB_REPOSITORY")
+
+          ref_json=$(gh api "$API/git/ref/tags/$TAG")
+          target_type=$(jq -r .object.type <<<"$ref_json")
+          target_sha=$(jq -r .object.sha <<<"$ref_json")
+          if [ "$target_type" = tag ]; then
+            target_sha=$(gh api "$API/git/tags/$target_sha" --jq .object.sha)
+          fi
+          [ "$target_sha" = "$GITHUB_SHA" ] || fail "$TAG now points to $target_sha, not the built $GITHUB_SHA"
+
+          # A pre-release never becomes "latest"; legacy = GitHub's date + semver rule, so a 1.4.3 patch after 2.0.0 doesn't either.
+          if [ "$PRERELEASE" = true ]; then make_latest=false; else make_latest=legacy; fi
+          release_json=$(gh api -X PATCH "$API/releases/$RELEASE_ID" -F draft=false -F prerelease="$PRERELEASE" -f make_latest="$make_latest")
+
+          # ---- Immutable releases: GitHub's release attestation verifies ----
+
+          immutable=$(jq -r '.immutable // false' <<<"$release_json")
+          if [ "$immutable" = true ]; then
+            gh release verify "$TAG" --repo "$GITHUB_REPOSITORY"
+          fi

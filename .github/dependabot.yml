@@ -1,0 +1,13 @@
+# Keeps the SHA-pinned actions current. Does NOT watch: build.yml/release.yml env pins
+# (Python, uv, cooldown default, tool pins) and setup-uv's `version:` input: bump those by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
