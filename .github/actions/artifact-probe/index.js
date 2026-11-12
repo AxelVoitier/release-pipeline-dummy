@@ -42,16 +42,26 @@ async function main() {
       body: JSON.stringify(body),
     });
     const text = await res.text();
-    console.log(`${method}: HTTP ${res.status} ${text.replace(/"signedUploadUrl":"[^"]*"/, '"signedUploadUrl":"<redacted>"')}`);
+    let result;
+    try {
+      result = JSON.parse(text);
+    } catch {
+      throw new Error(`${method} returned invalid JSON with HTTP ${res.status}`);
+    }
+    // Raw Twirp JSON uses snake_case; redact signed URLs before logging either form.
+    const safe = JSON.stringify(result, (key, value) => /signed.*url/i.test(key) ? '<redacted>' : value);
+    console.log(`${method}: HTTP ${res.status} ${safe}`);
     if (!res.ok) throw new Error(`${method} failed with HTTP ${res.status}`);
-    return JSON.parse(text);
+    return result;
   };
 
   const name = input('name');
   if (mode === 'upload') {
     const data = fs.readFileSync(input('file'));
     const created = await call('CreateArtifact', { ...ids, name, version: 4 });
-    const put = await fetch(created.signedUploadUrl, {
+    const uploadUrl = created.signed_upload_url ?? created.signedUploadUrl;
+    if (typeof uploadUrl !== 'string' || !uploadUrl) throw new Error('CreateArtifact returned no signed upload URL');
+    const put = await fetch(uploadUrl, {
       method: 'PUT',
       headers: { 'x-ms-blob-type': 'BlockBlob' },
       body: data,
@@ -61,7 +71,7 @@ async function main() {
     const finalized = await call('FinalizeArtifact', {
       ...ids, name, size: String(data.length), hash: `sha256:${input('sha256')}`,
     });
-    output('artifact-id', finalized.artifactId);
+    output('artifact-id', finalized.artifact_id ?? finalized.artifactId);
   } else if (mode === 'delete') {
     await call('DeleteArtifact', { ...ids, name });
   } else {
