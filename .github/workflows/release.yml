@@ -279,6 +279,7 @@ jobs:
   # Uploads exactly the built bytes to TestPyPI through the trusted publisher, with PEP 740 attestations.
   # Holds the OIDC token, so it runs no package code and has no checkout.
   publish-testpypi:
+    if: false # TEST-ONLY: the pypi leg uploads to TestPyPI instead
     needs: [origin-check, build]
     runs-on: ubuntu-latest
     environment: testpypi
@@ -376,6 +377,7 @@ jobs:
   # Proves the index serves exactly the built bytes, built by build.yml (GitHub attestation) and uploaded by our trusted
   # publisher (PEP 740), and that the wheel installs with its dependencies.
   verify-testpypi:
+    if: false # TEST-ONLY: the pypi leg verifies on TestPyPI instead
     needs: [origin-check, build, publish-testpypi]
     runs-on: ubuntu-latest
     permissions:
@@ -508,7 +510,7 @@ jobs:
 
   # The approval gate, then the same steps as publish-testpypi against PyPI, after re-checking the environments.
   publish-pypi:
-    needs: [origin-check, build, verify-testpypi]
+    needs: [origin-check, build] # TEST-ONLY: was [origin-check, build, verify-testpypi]
     runs-on: ubuntu-latest
     environment: pypi # APPROVAL GATE: required reviewers, no admin bypass, v* tag policy
     permissions:
@@ -521,8 +523,8 @@ jobs:
       SDIST_SHA256: ${{ needs.build.outputs.sdist-sha256 }}
       WHEEL: ${{ needs.build.outputs.wheel-name }}
       WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
-      INDEX: https://pypi.org
-      UPLOAD_URL: https://upload.pypi.org/legacy/
+      INDEX: https://test.pypi.org # TEST-ONLY: was https://pypi.org
+      UPLOAD_URL: https://test.pypi.org/legacy/ # TEST-ONLY: was https://upload.pypi.org/legacy/
     steps:
       - *check-envs
       - *check-tag
@@ -544,7 +546,7 @@ jobs:
       SDIST_SHA256: ${{ needs.build.outputs.sdist-sha256 }}
       WHEEL: ${{ needs.build.outputs.wheel-name }}
       WHEEL_SHA256: ${{ needs.build.outputs.wheel-sha256 }}
-      INDEX: https://pypi.org
+      INDEX: https://test.pypi.org # TEST-ONLY: was https://pypi.org
       EXPECTED_ENVIRONMENT: pypi
     outputs: # what github-release checks the pypi-provenance artifact against
       sdist-provenance-sha256: ${{ steps.provenance.outputs.sdist-provenance-sha256 }}
