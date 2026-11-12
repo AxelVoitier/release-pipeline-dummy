@@ -1,0 +1,299 @@
+# PROBE ONLY (real run, trip 1): observes facts the release workflows can't log. Never part of the template.
+# Delete it (and .github/actions/artifact-probe, environment probe-gate, secret PROBE_KEY) after trip 1.
+#
+#   gh workflow run probe.yml --ref main -f probe=<name>      # one probe per dispatch
+#   git push origin refs/heads/probe-hb refs/tags/probe-hb    # P7 (branch and tag with the same name)
+name: probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe:
+        description: Which probe to run
+        type: choice
+        options: [env-dump, b3-forge, token-reach, patterns, b7-rulesets, b2-deploy, gate-rerun]
+  push:
+    branches: [probe-hb]
+    tags: [probe-hb]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # P7: what github.ref / ref_name look like for a tag push vs a branch push of the same name.
+  # The runs' head_branch values are read afterwards with gh api (PHASE-1, P7).
+  head-branch:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print the ref context
+        run: echo "event=$GITHUB_EVENT_NAME ref=$GITHUB_REF ref_name=$GITHUB_REF_NAME ref_type=$GITHUB_REF_TYPE sha=$GITHUB_SHA"
+
+  # P9 (runner UV_*/PIP_* env, pip.conf, uv.toml) and P2 (is the runtime token visible to a run: step?).
+  env-dump:
+    if: inputs.probe == 'env-dump'
+    runs-on: ubuntu-latest
+    steps:
+      - name: UV_* / PIP_* variables and config files on the runner image
+        run: |
+          echo "== UV_* / PIP_* in a run: step's environment =="
+          env | grep -E '^(UV|PIP)_' || echo "none"
+          echo "== pip config sources =="
+          python3 -m pip config debug || true
+          for f in /etc/pip.conf /etc/xdg/pip/pip.conf "$HOME/.pip/pip.conf" "$HOME/.config/pip/pip.conf" \
+                   /etc/uv/uv.toml "$HOME/.config/uv/uv.toml"; do
+            if [ -e "$f" ]; then echo "-- $f"; cat "$f"; fi
+          done
+      - name: Runtime token reach from a run step (names only, never values)
+        run: |
+          echo "== ACTIONS_* variable names in a run: step =="
+          env | grep -oE '^ACTIONS_[A-Z_]+' | sort || echo "none"
+          echo "== Runner processes whose environment holds ACTIONS_RUNTIME_TOKEN (read with sudo) =="
+          for pid in $(pgrep -f 'Runner\.(Worker|Listener)' || true); do
+            if sudo cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | grep -q '^ACTIONS_RUNTIME_TOKEN='; then
+              echo "pid $pid $(cat "/proc/$pid/comm"): present"
+            else
+              echo "pid $pid $(cat "/proc/$pid/comm"): absent"
+            fi
+          done
+
+  # P1 (B3): does the artifact service compute the artifact digest, or record the uploader's value?
+  b3-forge:
+    if: inputs.probe == 'b3-forge'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Make a payload zip, its real digest and a forged one
+        id: payload
+        run: |
+          mkdir payload
+          echo "real bytes for run $GITHUB_RUN_ID" > payload/file.txt
+          (cd payload && zip -X -q ../payload.zip file.txt)
+          echo "real=$(sha256sum payload.zip | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "forged=$(printf 'not the payload' | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Upload "forged" with a hash that is NOT the payload's
+        uses: ./.github/actions/artifact-probe
+        continue-on-error: true
+        with:
+          mode: upload
+          name: forged
+          file: payload.zip
+          sha256: ${{ steps.payload.outputs.forged }}
+      - name: Upload "truthful" with the payload's real hash (same client, control)
+        uses: ./.github/actions/artifact-probe
+        with:
+          mode: upload
+          name: truthful
+          file: payload.zip
+          sha256: ${{ steps.payload.outputs.real }}
+      - name: Upload "official" with actions/upload-artifact (control)
+        id: official
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: official
+          path: payload/file.txt
+      - name: Read back the REST digest of each artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REAL: ${{ steps.payload.outputs.real }}
+          FORGED: ${{ steps.payload.outputs.forged }}
+          OFFICIAL_OUTPUT: ${{ steps.official.outputs.artifact-digest }}
+        run: |
+          echo "payload.zip real   = sha256:$REAL"
+          echo "forged value sent  = sha256:$FORGED"
+          echo "upload-artifact output artifact-digest = $OFFICIAL_OUTPUT"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[] | {name, id, size_in_bytes, digest}'
+  b3-download:
+    needs: b3-forge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download "forged" with actions/download-artifact (does it check the digest?)
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: forged
+          path: got-forged
+      - name: What arrived
+        env:
+          OUTCOME: ${{ steps.dl.outcome }}
+        run: |
+          echo "download outcome: $OUTCOME"
+          find got-forged -type f -exec sha256sum {} + 2>/dev/null || echo "nothing downloaded"
+
+  # P3: what an untrusted job can do with the runtime token: delete/re-upload another job's artifact, and use a
+  # token after its job ended (lifetime).
+  reach-a:
+    if: inputs.probe == 'token-reach'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Make A's file
+        run: echo "uploaded by job A" > a.txt
+      - name: Job A uploads "squat"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: squat
+          path: a.txt
+      - name: Save A's runtime token
+        id: tok
+        uses: ./.github/actions/artifact-probe
+        with:
+          mode: save-token
+          file: ${{ runner.temp }}/token-a
+      - name: A's token expiry
+        uses: ./.github/actions/artifact-probe
+        with:
+          mode: token-info
+      - name: Encrypt it with PROBE_KEY (public repo, so artifacts are readable)
+        env:
+          PROBE_KEY: ${{ secrets.PROBE_KEY }}
+        run: |
+          [ -n "$PROBE_KEY" ] || { echo "::error::secret PROBE_KEY not set"; exit 1; }
+          openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:PROBE_KEY -in "$RUNNER_TEMP/token-a" -out token-a.enc
+          shred -u "$RUNNER_TEMP/token-a"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: token-a-enc
+          path: token-a.enc
+  reach-b:
+    needs: reach-a
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: token-a-enc
+          path: enc
+      - name: Decrypt A's token
+        env:
+          PROBE_KEY: ${{ secrets.PROBE_KEY }}
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PROBE_KEY -in enc/token-a.enc -out "$RUNNER_TEMP/token-a"
+          chmod 600 "$RUNNER_TEMP/token-a"
+          echo "B's file" > b.txt && zip -X -q b.zip b.txt
+          echo "B_SHA=$(sha256sum b.zip | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - name: B deletes A's artifact "squat" with B's own token
+        continue-on-error: true
+        uses: ./.github/actions/artifact-probe
+        with:
+          mode: delete
+          name: squat
+      - name: B uploads its own bytes as "squat"
+        continue-on-error: true
+        uses: ./.github/actions/artifact-probe
+        with:
+          mode: upload
+          name: squat
+          file: b.zip
+          sha256: ${{ env.B_SHA }}
+      - name: B uses A's token, after A ended, to create "late"
+        continue-on-error: true
+        uses: ./.github/actions/artifact-probe
+        with:
+          mode: upload
+          name: late
+          file: b.zip
+          sha256: ${{ env.B_SHA }}
+          token-file: ${{ runner.temp }}/token-a
+      - name: Artifacts of this run now
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shred -u "$RUNNER_TEMP/token-a"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[] | {name, id, created_at, size_in_bytes, digest}'
+
+  # P4: download-artifact with a brace pattern and no merge: one folder per named artifact, decoys ignored?
+  patterns-up:
+    if: inputs.probe == 'patterns'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        name: [sdist, wheel, sdist-decoy, wheel2, other]
+    steps:
+      - name: Make a file
+        env:
+          NAME: ${{ matrix.name }}
+        run: echo "$NAME" > "$NAME.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.txt
+  patterns-down:
+    needs: patterns-up
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{sdist,wheel}"
+          path: in
+      - name: What was downloaded
+        run: find in -type f | sort
+
+  # P5 (B7): can GITHUB_TOKEN, with origin-check's permissions, see ruleset bypass lists, excludes and env settings?
+  b7-rulesets:
+    if: inputs.probe == 'b7-rulesets'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Rulesets as GITHUB_TOKEN sees them
+        run: |
+          API="repos/$GITHUB_REPOSITORY/rulesets"
+          gh api "$API?includes_parents=true" --paginate --jq '.[] | {id, name, target, enforcement, source_type}'
+          for id in $(gh api "$API?includes_parents=true" --paginate --jq '.[].id'); do
+            echo "== ruleset $id: top-level keys, then the fields B7 needs =="
+            gh api "$API/$id" --jq 'keys'
+            gh api "$API/$id" --jq '{name, bypass_actors, current_user_can_bypass, conditions, rules}'
+          done
+      - name: Environments as GITHUB_TOKEN sees them
+        run: |
+          for env in testpypi pypi; do
+            echo "== $env =="
+            gh api "repos/$GITHUB_REPOSITORY/environments/$env" \
+              --jq '{name, can_admins_bypass, deployment_branch_policy, protection_rules}'
+            gh api "repos/$GITHUB_REPOSITORY/environments/$env/deployment-branch-policies" --jq '.branch_policies'
+          done
+
+  # P6 (B2's threat): a non-tag ref tries to deploy to the testpypi and pypi environments. Expected: rejected by the
+  # v* tag policy before the job starts. No permissions, no OIDC.
+  b2-deploy:
+    if: inputs.probe == 'b2-deploy'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [testpypi, pypi]
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Reached the environment (should not happen from a branch)
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: echo "deployed to $ENVIRONMENT from $GITHUB_REF"
+
+  # P10: after an approved job ran, does "Re-run this job" ask for approval again?
+  gate-rerun:
+    if: inputs.probe == 'gate-rerun'
+    runs-on: ubuntu-latest
+    environment: probe-gate
+    steps:
+      - name: Attempt number
+        run: echo "run attempt $GITHUB_RUN_ATTEMPT"

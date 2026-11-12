@@ -1,0 +1,29 @@
+# PROBE ONLY (real run, trip 1). Never part of the template.
+# Hand-written calls to the Actions artifact service (the runtime API that actions/upload-artifact uses),
+# with no dependencies, so a probe can send values the official client never would (e.g. a forged hash).
+name: artifact-probe
+description: Probe-only runtime-API calls to the artifact service
+inputs:
+  mode:
+    description: "upload | delete | save-token | token-info"
+    required: true
+  name:
+    description: Artifact name (upload, delete)
+    required: false
+  file:
+    description: "upload: the zip to send; save-token: where to write the token (mode 600)"
+    required: false
+  sha256:
+    description: "upload: hex digest sent in FinalizeArtifact (may be forged on purpose)"
+    required: false
+  token-file:
+    description: Use the runtime token stored in this file instead of this job's own
+    required: false
+outputs:
+  artifact-id:
+    description: FinalizeArtifact's artifactId (upload)
+  token-exp:
+    description: Expiry of the runtime token used (ISO 8601)
+runs:
+  using: node24
+  main: index.js
