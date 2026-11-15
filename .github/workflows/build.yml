@@ -415,22 +415,48 @@ jobs:
             cyclonedx-py requirements --of JSON --sv 1.6 --output-reproducible \
             -o "$RUNNER_TEMP/lock.cdx.json" "$RUNNER_TEMP/build-constraints.txt"
 
-          # ---- Add the root component (both dist hashes) and the runtime requirements; mark the lock build-only ----
+          # ---- Licences: from the packages' own metadata (the lock lines carry none) ----
+
+          # The lock (hash-checked, wheels only) and our wheel go into a throwaway venv; installing a wheel only
+          # unpacks it. cyclonedx-py then reads each installed package's declared licence. It starts the venv's
+          # python, so a build dependency's .pth file would run here: this job holds no permission.
+          venv="$RUNNER_TEMP/sbom-venv"
+          uv venv --python "$PYTHON_VERSION" "$venv"
+          uv pip install --python "$venv/bin/python" --no-deps --only-binary :all: --require-hashes \
+            -r "$RUNNER_TEMP/build-constraints.txt"
+          uv pip install --python "$venv/bin/python" --no-deps "dist/$WHEEL"
+          uvx --python "$PYTHON_VERSION" --exclude-newer "$TOOLS_EXCLUDE_NEWER" --from "$CYCLONEDX_BOM" \
+            cyclonedx-py environment --of JSON --sv 1.6 --output-reproducible \
+            -o "$RUNNER_TEMP/licences.cdx.json" "$venv/bin/python"
+
+          # ---- Root component (both dist hashes, licence), runtime requirements, lock marked build-only with licences ----
 
           uv run --no-project --python "$PYTHON_VERSION" python -I - <<'PY'
-          import email.parser, json, os
+          import email.parser, json, os, re
 
           tmp = os.environ["RUNNER_TEMP"]
           metadata = email.parser.Parser().parse(open(f"{tmp}/METADATA"))
           name, version = metadata["Name"], metadata["Version"]
           bom = json.load(open(f"{tmp}/lock.cdx.json"))
 
+
+          def canonical(package):
+              return re.sub(r"[-_.]+", "-", package).lower()
+
+
+          # Declared licences by package name, from the venv holding exactly the lock + our wheel.
+          licences = {canonical(c["name"]): c["licenses"]
+                      for c in json.load(open(f"{tmp}/licences.cdx.json")).get("components", []) if c.get("licenses")}
+
           # Build lock: CycloneDX has no "build" scope; "excluded" = not part of the runtime.
           for component in bom.get("components", []):
               component["scope"] = "excluded"
               component.setdefault("properties", []).append({"name": "release-pipeline:scope", "value": "build"})
+              if canonical(component["name"]) in licences:
+                  component["licenses"] = licences[canonical(component["name"])]
 
           # Runtime requirements (Requires-Dist): unversioned, the requirement string kept as a property.
+          # No licence: a requirement is a version range, and a licence belongs to one version.
           for i, requirement in enumerate(metadata.get_all("Requires-Dist") or []):
               dependency = requirement.split(";")[0].strip()
               bare_name = dependency.split("[")[0]
@@ -455,7 +481,7 @@ jobs:
               }
 
 
-          # Root component: the package itself, with both distributions.
+          # Root component: the package itself, with both distributions and its declared licence.
           bom.setdefault("metadata", {})["component"] = {
               "type": "library",
               "bom-ref": "root",
@@ -467,6 +493,8 @@ jobs:
                   distribution(os.environ["WHEEL"], os.environ["WHEEL_SHA256"]),
               ],
           }
+          if canonical(name) in licences:
+              bom["metadata"]["component"]["licenses"] = licences[canonical(name)]
           json.dump(bom, open("sbom/sbom.cdx.json", "w"), indent=2, sort_keys=True)
           PY
 

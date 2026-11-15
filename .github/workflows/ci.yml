@@ -12,7 +12,7 @@ permissions: {}
 
 jobs:
   build:
-    uses: ./.github/workflows/build.yml
+    uses: $/.github/workflows/build.yml # $/ = this repository at the running commit
     # GitHub validates permission requests even for skipped attestation jobs.
     # Each called job narrows these grants; attest: false skips the signing jobs.
     permissions:

@@ -41,6 +41,7 @@ jobs:
     outputs:
       version: ${{ steps.tag.outputs.version }}
       prerelease: ${{ steps.tag.outputs.prerelease }}
+      ci-runs: ${{ steps.ci.outputs.ci-runs }}
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
@@ -209,7 +210,7 @@ jobs:
           jq -e '.can_admins_bypass != true' <<<"$pypi_json" >/dev/null \
             || fail "environment pypi allows administrators to bypass"
 
-      # Proves: active v* tag rulesets restrict creation and block update, deletion and force-push.
+      # Proves: active v* tag rulesets restrict creation and block update, deletion and force-push, and exclude no tag.
       - name: Check the v* tag rulesets exist
         run: |
           fail() { echo "::error::$*"; exit 1; }
@@ -223,7 +224,15 @@ jobs:
           # Those whose include list names refs/tags/v*.
           v_rulesets=$(jq '[.[] | select((.conditions.ref_name.include // []) | index("refs/tags/v*"))]' <<<"$rulesets_json")
 
-          # Bypass lists are not checked yet (decided after the first real run).
+          # ---- No exclusion carves release tags out of them ----
+
+          excluded=$(jq -r '[.[] | select((.conditions.ref_name.exclude // []) | length > 0)
+                             | "\(.name) excludes \(.conditions.ref_name.exclude | join(" "))"] | join("; ")' <<<"$v_rulesets")
+          [ -z "$excluded" ] || fail "a v* tag ruleset exempts some tags: $excluded"
+
+          # ---- Creation restricted; update, deletion and force-push blocked ----
+
+          # Bypass lists can't be checked here: GITHUB_TOKEN doesn't see them. The deploy-time admin audit does.
           jq -e 'any(.[]; any(.rules[]; .type == "creation"))' <<<"$v_rulesets" >/dev/null \
             || fail "no active v* tag ruleset restricts creation"
           jq -e 'def has_rule($t): any(.rules[]; .type == $t);
@@ -234,6 +243,7 @@ jobs:
       # Last, so the cheap checks above fail fast. Actions has no cross-workflow needs:, so poll.
       # Proves: CI passed on the tagged commit, and at least one of its runs used build.yml.
       - name: Wait for CI on the tagged commit (all green, at least one run uses build.yml)
+        id: ci
         env:
           RUN_ID: ${{ github.run_id }}
         run: |
@@ -264,10 +274,15 @@ jobs:
             sleep 30
           done
 
+          # The runs that used build.yml: publish-testpypi checks their wheel against the release's.
+          ci_runs=$(jq -r --arg p "$BUILD_YML" \
+            '[.[] | select(any(.referenced_workflows[]?; .path | startswith($p))) | .id] | join(" ")' <<<"$runs_json")
+          echo "ci-runs=$ci_runs" >> "$GITHUB_OUTPUT"
+
   # build-sdist -> attest-sdist -> build-wheel -> attest-wheel; sbom -> attest-sbom. Each inner job narrows these grants.
   build:
     needs: origin-check
-    uses: ./.github/workflows/build.yml
+    uses: $/.github/workflows/build.yml # $/ = this repository at the running commit
     permissions:
       contents: read
       id-token: write
@@ -286,6 +301,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: read # OPTIONAL: only for "Check CI tested these wheel bytes"
     env:
       VERSION: ${{ needs.origin-check.outputs.version }}
       SDIST: ${{ needs.build.outputs.sdist-name }}
@@ -327,6 +343,29 @@ jobs:
       - &check-dists
         name: Check digests against the build job outputs
         run: printf '%s  dist/%s\n' "$SDIST_SHA256" "$SDIST" "$WHEEL_SHA256" "$WHEEL" | sha256sum -c -
+      # OPTIONAL step: a project whose wheels aren't reproducible removes it, with `actions: read` above.
+      # Here only, not in publish-pypi: checking once, before anything is staged, is enough.
+      # Proves: every CI run that used build.yml on the tagged commit tested a wheel byte-identical to this one.
+      - &check-ci-wheel # TEST-ONLY: anchor so publish-pypi runs this exact step
+        name: Check CI tested these wheel bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUNS: ${{ needs.origin-check.outputs.ci-runs }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          [ -n "$CI_RUNS" ] || fail "origin-check reported no CI run that used build.yml"
+
+          # An artifact's recorded digest is whatever its uploader claimed, so hash the downloaded bytes here.
+          # The files stay outside dist/ and upload/: they are compared, never published.
+          for run_id in $CI_RUNS; do
+            ci_dir="$RUNNER_TEMP/ci-wheel-$run_id"
+            gh run download "$run_id" --name wheel --dir "$ci_dir" --repo "$GITHUB_REPOSITORY"
+            [ -f "$ci_dir/$WHEEL" ] || fail "CI run $run_id has no $WHEEL in its wheel artifact"
+            ci_sha256=$(sha256sum "$ci_dir/$WHEEL" | cut -d' ' -f1)
+            [ "$ci_sha256" = "$WHEEL_SHA256" ] \
+              || fail "CI run $run_id tested a different $WHEEL ($ci_sha256): the build is not reproducible"
+          done
       # Never skip-existing (it matches filenames, not hashes): absent -> upload, same sha256 -> skip, different -> fail.
       # Proves: no file of this version on the index differs from ours; selects which files still need uploading.
       - &hash-rule
@@ -531,6 +570,7 @@ jobs:
       - *dl-sdist
       - *dl-wheel
       - *check-dists
+      - *check-ci-wheel # TEST-ONLY: publish-testpypi is skipped, so its optional step runs here
       - *hash-rule
       - *publish
   # As verify-testpypi, against PyPI; also hands the verified provenance to github-release.
@@ -658,6 +698,20 @@ jobs:
             target_sha=$(gh api "$API/git/tags/$target_sha" --jq .object.sha)
           fi
           [ "$target_sha" = "$GITHUB_SHA" ] || fail "$TAG now points to $target_sha, not the built $GITHUB_SHA"
+
+          # ---- The release about to be published carries exactly our eight assets ----
+
+          # Read back by id: the releases list can miss a second draft, and `gh release upload` picks a release
+          # by tag name, so the assets could have landed on another draft than the one published below.
+          release_json=$(gh api "$API/releases/$RELEASE_ID")
+          extra=$(jq -r --args '[.assets[].name] - $ARGS.positional | join(", ")' "${expected[@]}" <<<"$release_json")
+          [ -z "$extra" ] || fail "release $RELEASE_ID for $TAG carries assets outside the expected set: $extra"
+          for asset in "${expected[@]}"; do
+            draft_digest=$(jq -r --arg a "$asset" '.assets[] | select(.name == $a) | .digest // ""' <<<"$release_json")
+            local_sha256=$(sha256sum "assets/$asset" | cut -d' ' -f1)
+            [ "$draft_digest" = "sha256:$local_sha256" ] \
+              || fail "release $RELEASE_ID: asset $asset differs or is missing ($draft_digest)"
+          done
 
           # A pre-release never becomes "latest"; legacy = GitHub's date + semver rule, so a 1.4.3 patch after 2.0.0 doesn't either.
           if [ "$PRERELEASE" = true ]; then make_latest=false; else make_latest=legacy; fi
