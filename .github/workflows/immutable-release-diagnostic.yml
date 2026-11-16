@@ -1,0 +1,58 @@
+name: immutable-release-diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify-existing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Match github-release exactly. Do not add attestation access for this diagnostic.
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v0.1.1rc5
+      EXPECTED_RELEASE_ID: '446451389'
+      EXPECTED_TAG_OBJECT: d5bee10100d6f307305070776994cb2a54761082
+      EXPECTED_COMMIT: ac2983b1dca853409aa47f8623d9d7aa508fae7e
+    steps:
+      # Proves: one verification attempt uses the release job's token on the affected release.
+      - name: Record identity and verify once
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          date -u +'%Y-%m-%dT%H:%M:%SZ'
+          gh --version
+          echo 'Declared job permissions: contents: write; all other configurable permissions: none'
+          echo "Repository: $GITHUB_REPOSITORY; workflow commit: $GITHUB_SHA; run: $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+          API="repos/$GITHUB_REPOSITORY"
+
+          release_json=$(gh api "$API/releases/$EXPECTED_RELEASE_ID")
+          jq '{id, tag_name, draft, immutable, published_at, target_commitish}' <<<"$release_json"
+          [ "$(jq -r .tag_name <<<"$release_json")" = "$TAG" ] || fail 'release tag changed'
+          [ "$(jq -r .draft <<<"$release_json")" = false ] || fail 'release is a draft'
+          [ "$(jq -r .immutable <<<"$release_json")" = true ] || fail 'release is not immutable'
+
+          ref_json=$(gh api "$API/git/ref/tags/$TAG")
+          jq '{ref, object}' <<<"$ref_json"
+          [ "$(jq -r .object.type <<<"$ref_json")" = tag ] || fail 'tag is not annotated'
+          [ "$(jq -r .object.sha <<<"$ref_json")" = "$EXPECTED_TAG_OBJECT" ] || fail 'tag object changed'
+          tag_json=$(gh api "$API/git/tags/$EXPECTED_TAG_OBJECT")
+          jq '{sha, tag, object, tagger: {date: .tagger.date}}' <<<"$tag_json"
+          [ "$(jq -r .object.sha <<<"$tag_json")" = "$EXPECTED_COMMIT" ] || fail 'tag commit changed'
+
+          echo "Verification started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          if gh release verify "$TAG" --repo "$GITHUB_REPOSITORY"; then
+            status=0
+          else
+            status=$?
+          fi
+          echo "Verification finished: $(date -u +'%Y-%m-%dT%H:%M:%SZ'); exit status: $status"
+          exit "$status"
