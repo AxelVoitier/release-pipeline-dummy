@@ -571,6 +571,48 @@ jobs:
       - *dl-wheel
       - *check-dists
       - *check-ci-wheel # TEST-ONLY: publish-testpypi is skipped, so its optional step runs here
+      # TEST-ONLY: create one distribution with the same trusted publisher before normal recovery.
+      - name: Prepare the trusted partial-upload fixture
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          [ "$INDEX" = https://test.pypi.org ] || fail 'fixture requires TestPyPI'
+          [ "$UPLOAD_URL" = https://test.pypi.org/legacy/ ] || fail 'fixture requires the TestPyPI upload endpoint'
+          [ "$VERSION" = 0.1.1rc6 ] || fail 'fixture is reserved for v0.1.1rc6'
+          NAME=${SDIST%-"$VERSION".tar.gz}
+          code=$(curl --max-time 30 -sSL -o "$RUNNER_TEMP/fixture-before.json" -w '%{http_code}' "$INDEX/pypi/$NAME/$VERSION/json")
+          [ "$code" = 404 ] || fail "fixture version must be absent, got HTTP $code"
+          mkdir partial-upload
+          cp "dist/$SDIST" partial-upload/
+      - name: Publish only the fixture sdist with trusted provenance
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: partial-upload/
+          attestations: true
+      - name: Wait for the fixture sdist before the normal hash rule
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          NAME=${SDIST%-"$VERSION".tar.gz}
+          deadline=$((SECONDS + 300))
+          while true; do
+            code=$(curl --max-time 10 -sSL -o "$RUNNER_TEMP/fixture-index.json" -w '%{http_code}' "$INDEX/pypi/$NAME/$VERSION/json")
+            case "$code" in
+              200)
+                count=$(jq '.urls | length' "$RUNNER_TEMP/fixture-index.json")
+                digest=$(jq -r --arg file "$SDIST" '.urls[] | select(.filename == $file) | .digests.sha256' "$RUNNER_TEMP/fixture-index.json")
+                if [ "$count" = 1 ] && [ "$digest" = "$SDIST_SHA256" ]; then
+                  echo "Trusted partial-upload fixture ready: only $SDIST, sha256 $digest"
+                  break
+                fi
+                ;;
+              404) ;;
+              *) fail "fixture index returned HTTP $code" ;;
+            esac
+            [ "$SECONDS" -lt "$deadline" ] || fail 'fixture sdist did not become visible within five minutes'
+            sleep 5
+          done
       - *hash-rule
       - *publish
   # As verify-testpypi, against PyPI; also hands the verified provenance to github-release.
@@ -668,7 +710,7 @@ jobs:
             [ -z "$extra" ] || fail "the release for $TAG carries assets outside the expected set: $extra"
           fi
 
-          # ---- Already published: assets identical, nothing to do (notes never touched) ----
+          # ---- Already published: assets identical (notes never touched) ----
 
           if [ -n "$release_json" ] && [ "$(jq -r .draft <<<"$release_json")" = false ]; then
             for asset in "${expected[@]}"; do
@@ -678,48 +720,69 @@ jobs:
                 || fail "published release asset $asset differs or is missing ($published_digest)"
             done
             echo "release already published with identical assets"
-            exit 0
+          else
+
+            # ---- Otherwise: draft (a prepared one keeps its notes), upload, tag still on the built commit, publish ----
+
+            if [ -z "$release_json" ]; then
+              # Notes are administrative text: a draft prepared for the tag keeps its body; otherwise the body stays empty.
+              release_json=$(gh api -X POST "$API/releases" -f tag_name="$TAG" -f name="$TAG" -F draft=true -F prerelease="$PRERELEASE")
+            fi
+            RELEASE_ID=$(jq -r .id <<<"$release_json")
+
+            (cd assets && gh release upload "$TAG" "${expected[@]}" --clobber --repo "$GITHUB_REPOSITORY")
+
+            ref_json=$(gh api "$API/git/ref/tags/$TAG")
+            target_type=$(jq -r .object.type <<<"$ref_json")
+            target_sha=$(jq -r .object.sha <<<"$ref_json")
+            if [ "$target_type" = tag ]; then
+              target_sha=$(gh api "$API/git/tags/$target_sha" --jq .object.sha)
+            fi
+            [ "$target_sha" = "$GITHUB_SHA" ] || fail "$TAG now points to $target_sha, not the built $GITHUB_SHA"
+
+            # ---- The release about to be published carries exactly our eight assets ----
+
+            # Read back by id: the releases list can miss a second draft, and `gh release upload` picks a release
+            # by tag name, so the assets could have landed on another draft than the one published below.
+            release_json=$(gh api "$API/releases/$RELEASE_ID")
+            extra=$(jq -r --args '[.assets[].name] - $ARGS.positional | join(", ")' "${expected[@]}" <<<"$release_json")
+            [ -z "$extra" ] || fail "release $RELEASE_ID for $TAG carries assets outside the expected set: $extra"
+            for asset in "${expected[@]}"; do
+              draft_digest=$(jq -r --arg a "$asset" '.assets[] | select(.name == $a) | .digest // ""' <<<"$release_json")
+              local_sha256=$(sha256sum "assets/$asset" | cut -d' ' -f1)
+              [ "$draft_digest" = "sha256:$local_sha256" ] \
+                || fail "release $RELEASE_ID: asset $asset differs or is missing ($draft_digest)"
+            done
+
+            # A pre-release never becomes "latest"; legacy = GitHub's date + semver rule, so a 1.4.3 patch after 2.0.0 doesn't either.
+            if [ "$PRERELEASE" = true ]; then make_latest=false; else make_latest=legacy; fi
+            release_json=$(gh api -X PATCH "$API/releases/$RELEASE_ID" -F draft=false -F prerelease="$PRERELEASE" -f make_latest="$make_latest")
+
           fi
-
-          # ---- Otherwise: draft (a prepared one keeps its notes), upload, tag still on the built commit, publish ----
-
-          if [ -z "$release_json" ]; then
-            # Notes are administrative text: a draft prepared for the tag keeps its body; otherwise the body stays empty.
-            release_json=$(gh api -X POST "$API/releases" -f tag_name="$TAG" -f name="$TAG" -F draft=true -F prerelease="$PRERELEASE")
-          fi
-          RELEASE_ID=$(jq -r .id <<<"$release_json")
-
-          (cd assets && gh release upload "$TAG" "${expected[@]}" --clobber --repo "$GITHUB_REPOSITORY")
-
-          ref_json=$(gh api "$API/git/ref/tags/$TAG")
-          target_type=$(jq -r .object.type <<<"$ref_json")
-          target_sha=$(jq -r .object.sha <<<"$ref_json")
-          if [ "$target_type" = tag ]; then
-            target_sha=$(gh api "$API/git/tags/$target_sha" --jq .object.sha)
-          fi
-          [ "$target_sha" = "$GITHUB_SHA" ] || fail "$TAG now points to $target_sha, not the built $GITHUB_SHA"
-
-          # ---- The release about to be published carries exactly our eight assets ----
-
-          # Read back by id: the releases list can miss a second draft, and `gh release upload` picks a release
-          # by tag name, so the assets could have landed on another draft than the one published below.
-          release_json=$(gh api "$API/releases/$RELEASE_ID")
-          extra=$(jq -r --args '[.assets[].name] - $ARGS.positional | join(", ")' "${expected[@]}" <<<"$release_json")
-          [ -z "$extra" ] || fail "release $RELEASE_ID for $TAG carries assets outside the expected set: $extra"
-          for asset in "${expected[@]}"; do
-            draft_digest=$(jq -r --arg a "$asset" '.assets[] | select(.name == $a) | .digest // ""' <<<"$release_json")
-            local_sha256=$(sha256sum "assets/$asset" | cut -d' ' -f1)
-            [ "$draft_digest" = "sha256:$local_sha256" ] \
-              || fail "release $RELEASE_ID: asset $asset differs or is missing ($draft_digest)"
-          done
-
-          # A pre-release never becomes "latest"; legacy = GitHub's date + semver rule, so a 1.4.3 patch after 2.0.0 doesn't either.
-          if [ "$PRERELEASE" = true ]; then make_latest=false; else make_latest=legacy; fi
-          release_json=$(gh api -X PATCH "$API/releases/$RELEASE_ID" -F draft=false -F prerelease="$PRERELEASE" -f make_latest="$make_latest")
 
           # ---- Immutable releases: GitHub's release attestation verifies ----
 
           immutable=$(jq -r '.immutable // false' <<<"$release_json")
           if [ "$immutable" = true ]; then
-            gh release verify "$TAG" --repo "$GITHUB_REPOSITORY"
+            # A new release may not be verifiable immediately. Keep the same token and fail at the deadline.
+            deadline=$((SECONDS + 300))
+            attempt=0
+            while true; do
+              remaining=$((deadline - SECONDS))
+              [ "$remaining" -gt 0 ] || fail "immutable release verification did not succeed within 300 seconds"
+              attempt_started=$SECONDS
+              attempt=$((attempt + 1))
+              echo "Immutable verification attempt $attempt: $(date -u +'%Y-%m-%dT%H:%M:%SZ'); remaining: ${remaining}s"
+              if timeout --signal=KILL "${remaining}s" gh release verify "$TAG" --repo "$GITHUB_REPOSITORY"; then
+                echo "Immutable verification succeeded: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+                break
+              fi
+              remaining=$((deadline - SECONDS))
+              [ "$remaining" -gt 0 ] || fail "immutable release verification did not succeed within 300 seconds"
+              wait_seconds=$((10 - SECONDS + attempt_started))
+              [ "$wait_seconds" -le "$remaining" ] || wait_seconds=$remaining
+              if [ "$wait_seconds" -gt 0 ]; then
+                sleep "$wait_seconds"
+              fi
+            done
           fi
